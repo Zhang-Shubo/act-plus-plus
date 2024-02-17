@@ -23,10 +23,39 @@ from visualize_episodes import save_videos
 
 from detr.models.latent_model import Latent_Model_Transformer
 
+from torch.optim.lr_scheduler import StepLR
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    CPUOffload,
+    BackwardPrefetch,
+)
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    enable_wrap,
+    wrap,
+)
+
 from sim_env import BOX_POSE
 
 import IPython
 e = IPython.embed
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the process group
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
 
 def get_auto_index(dataset_dir):
     max_idx = 1000
@@ -91,7 +120,7 @@ def main(args):
                          'vq_class': args['vq_class'],
                          'vq_dim': args['vq_dim'],
                          'action_dim': 16,
-                         'no_encoder': args['no_encoder']
+                         'no_encoder': args['no_encoder'],
                          }
     elif policy_class == 'Diffusion':
 
@@ -139,7 +168,6 @@ def main(args):
         'real_robot': not is_sim,
         'load_pretrain': args['load_pretrain'],
         'actuator_config': actuator_config,
-        'bb': args['bb'] 
     }
 
     if not os.path.isdir(ckpt_dir):
@@ -229,7 +257,6 @@ def get_image(ts, camera_names, rand_crop_resize=False):
 
 def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
     set_seed(1000)
-    torch.cuda.set_device(1)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -248,7 +275,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.deserialize(torch.load(ckpt_path, map_location="cuda:1"))
+    loading_status = policy.deserialize(torch.load(ckpt_path))
     print(loading_status)
     policy.cuda()
     policy.eval()
@@ -531,8 +558,7 @@ def eval_bc(config, ckpt_name, save_episode=True, num_rollouts=50):
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
-    device = next(policy.parameters()).device
-    image_data, qpos_data, action_data, is_pad = image_data.to(device), qpos_data.to(device), action_data.to(device), is_pad.to(device)
+    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -547,7 +573,6 @@ def train_bc(train_dataloader, val_dataloader, config):
     save_every = config['save_every']
 
     set_seed(seed)
-    torch.cuda.set_device(0)
 
     policy = make_policy(policy_class, policy_config)
     if config['load_pretrain']:
@@ -582,7 +607,7 @@ def train_bc(train_dataloader, val_dataloader, config):
                 epoch_val_loss = validation_summary['loss']
                 if epoch_val_loss < min_val_loss:
                     min_val_loss = epoch_val_loss
-                    best_ckpt_info = (step, min_val_loss, policy.serialize())
+                    best_ckpt_info = (step, min_val_loss, deepcopy(policy.serialize()))
             for k in list(validation_summary.keys()):
                 validation_summary[f'val_{k}'] = validation_summary.pop(k)            
             wandb.log(validation_summary, step=step)
@@ -600,7 +625,6 @@ def train_bc(train_dataloader, val_dataloader, config):
             torch.save(policy.serialize(), ckpt_path)
             success, _ = eval_bc(config, ckpt_name, save_episode=True, num_rollouts=10)
             wandb.log({'success': success}, step=step)
-            torch.cuda.set_device(0)
 
         # training
         policy.train()
@@ -668,7 +692,5 @@ if __name__ == '__main__':
     parser.add_argument('--vq_class', action='store', type=int, help='vq_class')
     parser.add_argument('--vq_dim', action='store', type=int, help='vq_dim')
     parser.add_argument('--no_encoder', action='store_true')
-
-    parser.add_argument('--bb', action='store', type=str, default="resnet")
     
     main(vars(parser.parse_args()))

@@ -186,7 +186,6 @@ class TransformerEncoderLayer(nn.Module):
                      src_mask: Optional[Tensor] = None,
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
-        import pdb; pdb.set_trace()
         # src 102 * bs * hs = 102 * 8 * 512; with_pos_embed做了一个按位叠加的操作
         q = k = self.with_pos_embed(src, pos)
         # key_padding_mask bs * 102, src_mask = None

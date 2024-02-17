@@ -13,6 +13,8 @@ from .llava_act import LlavaForConditionalGeneration
 import numpy as np
 from PIL import Image
 
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
+
 import IPython
 e = IPython.embed
 
@@ -312,10 +314,19 @@ def build(args):
     # transformer = build_transformer(args)
 
     transformer = LlavaForConditionalGeneration.from_pretrained(
-        "/mnt/llava-7b-hf", torch_dtype=torch.bfloat16,
+        "/mnt/llava-7b-hf", torch_dtype=torch.bfloat16, 
         low_cpu_mem_usage=True).cuda()
+    # import pdb; pdb.set_trace()
+    peft_config = LoraConfig(
+        task_type=TaskType.FEATURE_EXTRACTION, inference_mode=False, r=64, lora_alpha=32, lora_dropout=0.1,
+        target_modules=".*language_model.*self_attn.*(q|v|o)_proj"
+    )
+    transformer = get_peft_model(transformer, peft_config)
+    print("peft parameter")
+    transformer.print_trainable_parameters()
 
-    if args.no_encoder or True:
+
+    if args.no_encoder:
         encoder = None
     else:
         encoder = build_encoder(args)

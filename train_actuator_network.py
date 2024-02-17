@@ -84,7 +84,7 @@ def main():
     policy = ActuatorNetwork(prediction_len).cuda()
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
-    n_parameters = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    n_ = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     min_val_loss = np.inf

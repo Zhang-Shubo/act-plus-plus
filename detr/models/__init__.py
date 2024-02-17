@@ -4,7 +4,10 @@ from .detr_vae_llava import build as build_vae_llava
 from .detr_vae import build_cnnmlp as build_cnnmlp
 
 def build_ACT_model(args):
-    return build_vae_llava(args)
+    if args.bb == "llava":
+        return build_vae_llava(args)
+    else:
+        return build_vae(args)
 
 def build_CNNMLP_model(args):
     return build_cnnmlp(args)
