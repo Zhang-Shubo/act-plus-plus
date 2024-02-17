@@ -8,8 +8,10 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
-
+from transformers import AutoProcessor
+from .llava_act import LlavaForConditionalGeneration
 import numpy as np
+from PIL import Image
 
 import IPython
 e = IPython.embed
@@ -51,11 +53,15 @@ class DETRVAE(nn.Module):
         self.encoder = encoder
         self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim
         self.state_dim, self.action_dim = state_dim, action_dim
-        hidden_dim = transformer.d_model
+        hidden_dim = transformer.d_model if backbones != "llava" else transformer.language_model.config.hidden_size
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        if backbones is not None:
+        if backbones == "llava":
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
+            self.processor = AutoProcessor.from_pretrained("/mnt/llava-7b-hf")
+            self.backbones = backbones
+        elif backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             # 摄像头图像主干网络
             self.backbones = nn.ModuleList(backbones)
@@ -155,31 +161,43 @@ class DETRVAE(nn.Module):
         actions: batch, seq, action_dim
         """
         latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)
-        
-        # cvae decoder
-        if self.backbones is not None:
+        batch_size, *_ = qpos.shape
+        if self.backbones == "llava":
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
             for cam_id, cam_name in enumerate(self.camera_names):
-                
+                # features, pos = self.backbones[cam_id](image[:, cam_id])
+                # image = Image.open(image[:, cam_id])
+                # input_ids is 8 * 12; pixel_values is [8, 3, 336, 336]
+                inputs = self.processor(text=["USER: <image>\ntransfer cube\n<proprio><latent><chunk_input>" for _ in range(batch_size)], images=image[:, cam_id], return_tensors="pt").to("cuda")
+                break # TODO 先只支持一张图像
+
+            # proprioception features 8 * 4096
+            proprio_input = self.input_proj_robot_state(qpos)
+            hs = self.transformer(**inputs, latent_input=latent_input, proprio_input=proprio_input, query_embeds=self.query_embed.weight, output_hidden_states=True)["act_hidden_states"]
+            hs = hs.to(torch.float32)
+
+        # cvae decoder
+        elif self.backbones is not None:
+            # Image observation features and position embeddings
+            all_cam_features = []
+            all_cam_pos = []
+            for cam_id, cam_name in enumerate(self.camera_names):
+                # import pdb; pdb.set_trace()
                 features, pos = self.backbones[cam_id](image[:, cam_id])
-                # features BS * Hidden size * 15 * 20
                 features = features[0] # take the last layer feature
                 pos = pos[0]
-                # 维度没变
                 all_cam_features.append(self.input_proj(features))
                 all_cam_pos.append(pos)
             # proprioception features
-            # qpos BS * 14; proprio_input BS*512
             proprio_input = self.input_proj_robot_state(qpos)
-            # 一个摄像头，cat后为度不变
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
-            # pos 1 * 512 * 15 * 20
             pos = torch.cat(all_cam_pos, axis=3)
-            # import pdb; pdb.set_trace()
+
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -284,18 +302,24 @@ def build(args):
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
-    backbones = []
-    for _ in args.camera_names:
-        # 每个摄像头图像都单独使用一个backbone？
-        backbone = build_backbone(args)
-        backbones.append(backbone)
+    # backbones = []
+    # for _ in args.camera_names:
+    #     # 每个摄像头图像都单独使用一个backbone？
+    #     backbone = build_backbone(args)
+    #     backbones.append(backbone)
+    backbones = "llava"
 
-    transformer = build_transformer(args)
+    # transformer = build_transformer(args)
 
-    if args.no_encoder:
+    transformer = LlavaForConditionalGeneration.from_pretrained(
+        "/mnt/llava-7b-hf", torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True).cuda()
+
+    if args.no_encoder or True:
         encoder = None
     else:
         encoder = build_encoder(args)
+
     model = DETRVAE(
         backbones,
         transformer,

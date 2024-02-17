@@ -49,6 +49,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         episode_id, start_ts = self._locate_transition(index)
         dataset_path = self.dataset_path_list[episode_id]
         try:
+            
             # print(dataset_path)
             with h5py.File(dataset_path, 'r') as root:
                 try: # some legacy data does not have this attribute

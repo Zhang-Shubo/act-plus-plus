@@ -95,6 +95,7 @@ def build_ACT_model_and_optimizer(args_override):
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
+        # 设置不同学习率
         {
             "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
             "lr": args.lr_backbone,

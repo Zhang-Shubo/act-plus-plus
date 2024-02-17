@@ -48,18 +48,33 @@ class Transformer(nn.Module):
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
         # TODO flatten only when input has H and W
+        # import pdb; pdb.set_trace()
+        
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
             bs, c, h, w = src.shape
+            # src bs * hs * h * w = 8, 512, 15, 20
             src = src.flatten(2).permute(2, 0, 1)
+            # src become  hw * bs * hs = 300 * 8 * 512
+            # pos_embed = 1 * hs * h * w
             pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+            # pos_embed become hw * bs * hs = 300 * 8 * 512
+            
+            # query_embed = 100 * hs
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+            # query_embed become k * bs * hs = 100 * 8 * 512
             # mask = mask.flatten(1)
 
+            # additional_pos_embed.shape = 2 * 512, 为了和图像输入对齐
             additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1) # seq, bs, dim
+            # additional_pos_embed become 2 * 8 * 512 , 
+            
+            # pos embed 302 * 8 * 512
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
+            # latent_input 8 * 512, proprio_input 8 * 512, addition_input 2 * 8 * 512
             addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            
             src = torch.cat([addition_input, src], axis=0)
         else:
             assert len(src.shape) == 3
@@ -70,7 +85,10 @@ class Transformer(nn.Module):
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
         tgt = torch.zeros_like(query_embed)
+        # memory 302 * 8 * 512
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        # tgt 102 * 8 * 512, memory, 302 * 8 * 512, mask is None,
+        # pos_embed is 302 * 8 * 512, query embed is 102 * 8 * 512
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         hs = hs.transpose(1, 2)
@@ -168,7 +186,10 @@ class TransformerEncoderLayer(nn.Module):
                      src_mask: Optional[Tensor] = None,
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
+        import pdb; pdb.set_trace()
+        # src 102 * bs * hs = 102 * 8 * 512; with_pos_embed做了一个按位叠加的操作
         q = k = self.with_pos_embed(src, pos)
+        # key_padding_mask bs * 102, src_mask = None
         src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
                               key_padding_mask=src_key_padding_mask)[0]
         src = src + self.dropout1(src2)
@@ -196,8 +217,10 @@ class TransformerEncoderLayer(nn.Module):
                 src_mask: Optional[Tensor] = None,
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None):
+        # pre LN
         if self.normalize_before:
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
+        # post LN
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
 
@@ -233,6 +256,7 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
+        
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
