@@ -58,7 +58,7 @@ def select_with_start(tensor, start_tensor, k=100):
     return tensor[mask].view(batch_size, k, -1)
 
 
-def fill_chunk_input(tensor, start_tensor, query_embeds):
+def fill_chunk_input(tensor, start_tensor, query_embeds, action_embedding):
     k, _ = query_embeds.shape
     batch_size, seq_len, _ = tensor.shape
     ends = start_tensor
@@ -69,7 +69,8 @@ def fill_chunk_input(tensor, start_tensor, query_embeds):
     ends_exp = ends.unsqueeze(1)
     # start_tensor是位置，从1开始计算的
     mask = (cols > starts_exp) & (cols <= ends_exp)
-    tensor[mask] = torch.tile(query_embeds, (batch_size, 1))
+    # tensor[mask] = torch.tile(query_embeds, (batch_size, 1))
+    tensor[mask] = action_embedding
     return tensor
 
 
@@ -312,7 +313,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
         return model_embeds
 
     def _merge_input_ids_with_image_features(
-        self, image_features, inputs_embeds, input_ids, attention_mask, position_ids, proprio_input, latent_input, query_embeds
+        self, image_features, inputs_embeds, input_ids, attention_mask, position_ids, proprio_input, latent_input, query_embeds, action_embedding
     ):
         
         num_images, num_image_patches, embed_dim = image_features.shape
@@ -358,7 +359,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
         # 填入chunk_input
         batch_indices_for_chunk, chunk_input_indices = torch.where(input_ids == self.config.chunk_input_token_index)
         new_chunk_index = new_token_positions[batch_indices_for_chunk, chunk_input_indices]
-        final_embedding = fill_chunk_input(final_embedding, new_chunk_index, query_embeds) 
+        final_embedding = fill_chunk_input(final_embedding, new_chunk_index, query_embeds, action_embedding) 
         # 填入proproi 和 latent
         batch_indices_for_proprio, proprio_indices = torch.where(input_ids == self.config.proprio_token_index)
         new_proprio_index = new_token_positions[batch_indices_for_proprio, proprio_indices]
@@ -400,6 +401,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
         latent_input: torch.FloatTensor = None,
         proprio_input: torch.FloatTensor = None,
         query_embeds: torch.FloatTensor = None,
+        action_embedding: torch.FloatTensor = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         vision_feature_layer: Optional[int] = None,
@@ -441,6 +443,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
         "There seems to be a stop sign"
         ```"""
         query_embeds = query_embeds.to(dtype=torch.bfloat16)
+        action_embedding = action_embedding.to(dtype=torch.bfloat16)
         proprio_input = proprio_input.to(dtype=torch.bfloat16)
         latent_input = latent_input.to(dtype=torch.bfloat16)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -478,7 +481,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
 
                 image_features = self.multi_modal_projector(selected_image_feature)
                 inputs_embeds, attention_mask, position_ids, new_chunk_index = self._merge_input_ids_with_image_features(
-                    image_features, inputs_embeds, input_ids, attention_mask, position_ids, proprio_input, latent_input, query_embeds
+                    image_features, inputs_embeds, input_ids, attention_mask, position_ids, proprio_input, latent_input, query_embeds, action_embedding
                 )
                 if labels is None:
                     labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)

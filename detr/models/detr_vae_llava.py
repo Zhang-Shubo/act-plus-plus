@@ -58,10 +58,11 @@ class DETRVAE(nn.Module):
         hidden_dim = transformer.d_model if backbones != "llava" else transformer.language_model.config.hidden_size
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
+        # action chunk 的编码
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones == "llava":
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
-            self.processor = AutoProcessor.from_pretrained("/mnt/llava-7b-hf")
+            self.processor = AutoProcessor.from_pretrained("/mnt/models/llava-7b-hf")
             self.backbones = backbones
         elif backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
@@ -155,7 +156,7 @@ class DETRVAE(nn.Module):
 
         return latent_input, probs, binaries, mu, logvar
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None, action_embedding=None, action_mask=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -177,7 +178,9 @@ class DETRVAE(nn.Module):
 
             # proprioception features 8 * 4096
             proprio_input = self.input_proj_robot_state(qpos)
-            hs = self.transformer(**inputs, latent_input=latent_input, proprio_input=proprio_input, query_embeds=self.query_embed.weight, output_hidden_states=True)["act_hidden_states"]
+            # query_embeds - action chunk的输入编码
+            # inputs - 包括了图像与文本token
+            hs = self.transformer(**inputs, latent_input=latent_input, proprio_input=proprio_input, query_embeds=self.query_embed.weight, action_embedding=action_embedding, output_hidden_states=True)["act_hidden_states"]
             hs = hs.to(torch.float32)
 
         # cvae decoder
@@ -205,9 +208,12 @@ class DETRVAE(nn.Module):
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+
+        # 晚融合
+        # hs = hs + torch.tile(torch.unsqueeze(self.query_embed.weight, 0), (batch_size, 1, 1))
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
-        return a_hat, is_pad_hat, [mu, logvar], probs, binaries
+        return a_hat, is_pad_hat, [mu, logvar], probs, binaries, hs
 
 
 
@@ -314,11 +320,11 @@ def build(args):
     # transformer = build_transformer(args)
 
     transformer = LlavaForConditionalGeneration.from_pretrained(
-        "/mnt/llava-7b-hf", torch_dtype=torch.bfloat16, 
+        "/mnt/models/llava-7b-hf", torch_dtype=torch.bfloat16, 
         low_cpu_mem_usage=True).cuda()
     # import pdb; pdb.set_trace()
     peft_config = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION, inference_mode=False, r=64, lora_alpha=32, lora_dropout=0.1,
+        task_type=TaskType.FEATURE_EXTRACTION, inference_mode=False, r=8, lora_alpha=16, lora_dropout=0.2,
         target_modules=".*language_model.*self_attn.*(q|v|o)_proj"
     )
     transformer = get_peft_model(transformer, peft_config)

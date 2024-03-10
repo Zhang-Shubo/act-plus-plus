@@ -3,6 +3,8 @@ from torch.nn import functional as F
 import torchvision.transforms as transforms
 import torch
 import numpy as np
+from gym import spaces
+import action_tokenizer
 from detr.main import build_ACT_model_and_optimizer, build_CNNMLP_model_and_optimizer
 import IPython
 e = IPython.embed
@@ -196,6 +198,67 @@ class DiffusionPolicy(nn.Module):
             status = [status, status_ema]
         return status
 
+
+def action_tokenize(action_chunk, vocab_size):
+    # action_chunk is batch_size * chunk_size * 16
+    scope = torch.tensor(
+        [
+            [-3, 3], [-3, 3], [-3, 3], 
+            [-2, 2], [-2, 2], [-2, 2], [-2, 2], 
+            [-3, 3]
+        ], device=action_chunk.device
+    )
+    assert scope.shape[0] * 2 == action_chunk.shape[2], "action维度不匹配"
+    low = scope[:, 0]
+    high = scope[:, 1]
+    def single_arm_tokenize(single_action_chunk):
+        # single_action_chunk is (batch_size*chunk_size) * 8
+        single_action_chunk = torch.clamp(single_action_chunk, min=low, max=high)
+        token = (single_action_chunk - low) / (high - low)
+        token = token * (vocab_size - 1)
+        token = token.to(torch.int32)
+        return token
+    
+    batch_size, chunk_size, action_dim = action_chunk.shape
+    single_action_dim = action_dim//2
+    action_chunk = action_chunk.view(batch_size * chunk_size, -1)
+    left = single_arm_tokenize(action_chunk[:, :single_action_dim])
+    right = single_arm_tokenize(action_chunk[:, single_action_dim:])
+    action_token = torch.concat([left, right], dim=1)
+    action_token = action_token.view(batch_size, chunk_size, -1)
+    return action_token
+
+
+def action_detokenize(action_hat, vocab_size):
+    # action_chunk is batch_size * (chunk_size * 16)
+    scope = torch.tensor(
+        [
+            [-3, 3], [-3, 3], [-3, 3], 
+            [-2, 2], [-2, 2], [-2, 2], [-2, 2], 
+            [-3, 3]
+        ], device=action_hat.device
+    )
+    low = scope[:, 0]
+    high = scope[:, 1]
+    def single_arm_detokenize(single_action_hat):
+        # single_action_chunk is (batch_size*chunk_size) * 8
+        single_action_hat = single_action_hat / (vocab_size - 1)
+        single_action_hat = single_action_hat * (high - low) + low
+        return single_action_hat
+
+    batch_size, chunk_size_x_action_dim = action_hat.shape
+    action_dim = 16
+    chunk_size = chunk_size_x_action_dim / action_dim
+    single_action_dim = action_dim // 2
+    action_hat = action_hat.view(batch_size, chunk_size, -1).view(-1, action_dim)
+    
+    left = single_arm_detokenize(action_hat[:, :single_action_dim])
+    right = single_arm_detokenize(action_hat[:, single_action_dim:])
+    action_hat = torch.concat([left, right], dim=1)
+    action_hat = action_hat.view(batch_size, chunk_size, -1)
+    return action_hat
+
+
 class ACTPolicy(nn.Module):
     def __init__(self, args_override):
         super().__init__()
@@ -204,6 +267,24 @@ class ACTPolicy(nn.Module):
         self.optimizer = optimizer
         self.kl_weight = args_override['kl_weight']
         self.vq = args_override['vq']
+        self.action_embedding = nn.Embedding(256, 4096)
+        self.action_head = nn.Embedding(4096, 256)
+
+        # 定义动作空间
+        output_tensor_space = spaces.Dict(
+            OrderedDict(
+                [
+                    ("position_vector", spaces.Box(low=-3, high=3, shape=(3,), dtype=np.float32)),
+                    ("rotation_delta", spaces.Box(low=-2, high=2, shape=(4,), dtype=np.float32)),
+                    ("gripper_closedness_action", spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)),
+                ]
+            )
+        )
+
+        # 初始化动作分词器
+        vocab_size = 256
+        self.act_tokenizer = action_tokenizer.RT1ActionTokenizer(output_tensor_space, vocab_size=vocab_size)
+        self.loss_fn = nn.CrossEntropyLoss()
         print(f'KL Weight {self.kl_weight}')
 
     def __call__(self, qpos, image, actions=None, is_pad=None, vq_sample=None):
@@ -215,25 +296,52 @@ class ACTPolicy(nn.Module):
             image = normalize(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
+            import pdb; pdb.set_trace()
+
+            ##### 离散化 ######
+            tokens = action_tokenize(actions, 256)
+            # tokens bs * chunk_size * 16
+            bs, cs, act_dim = tokens.shape
+            action_embedding = self.action_embedding(tokens)
+            # 中间维度是100个16维
+            action_embedding = action_embedding.view(bs, cs * act_dim, -1)
+            ##### 离散化 ######
+
             is_pad = is_pad[:, :self.model.num_queries]
 
+            ##### 离散化 ######
+            action_mask = torch.unsqueeze(is_pad, 2)
+            action_mask = torch.tile(action_mask, [1, 1, act_dim])
+            action_mask = action_mask.view(bs, cs * act_dim)
+            ##### 离散化 ######
+
             loss_dict = dict()
-            a_hat, is_pad_hat, (mu, logvar), probs, binaries = self.model(qpos, image, env_state, actions, is_pad, vq_sample)
-            if self.vq or self.model.encoder is None:
-                total_kld = [torch.tensor(0.0)]
-            else:
-                total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
-            if self.vq:
-                loss_dict['vq_discrepancy'] = F.l1_loss(probs, binaries, reduction='mean')
-            all_l1 = F.l1_loss(actions, a_hat, reduction='none')
-            l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
-            loss_dict['l1'] = l1
-            loss_dict['kl'] = total_kld[0]
-            loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+            # a_hat, is_pad_hat, (mu, logvar), probs, binaries = self.model(qpos, image, env_state, actions, is_pad, vq_sample)
+            a_hat, is_pad_hat, (mu, logvar), probs, binaries, hs = self.model(qpos, image, env_state, actions, is_pad, vq_sample, action_embedding, action_mask)
+            
+            action_hat = self.action_head(hs)
+            loss_dict["loss"] =  self.loss_fn(action_hat, tokens.view(bs, -1, 16))
+            loss_dict['l1'] = 0
+            loss_dict['kl'] = 0
+            # if self.vq or self.model.encoder is None:
+            #     total_kld = [torch.tensor(0.0)]
+            # else:
+            #     total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
+            # if self.vq:
+            #     loss_dict['vq_discrepancy'] = F.l1_loss(probs, binaries, reduction='mean')
+            # all_l1 = F.l1_loss(actions, a_hat, reduction='none')
+            # l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+            # loss_dict['l1'] = l1
+            # loss_dict['kl'] = total_kld[0]
+            # loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _), _, _ = self.model(qpos, image, env_state, vq_sample=vq_sample) # no action, sample from prior
-            return a_hat
+            # a_hat, _, (_, _), _, _ = self.model(qpos, image, env_state, vq_sample=vq_sample) # no action, sample from prior
+            a_hat, is_pad_hat, (mu, logvar), probs, binaries, hs = self.model(qpos, image, env_state, actions, is_pad, vq_sample, action_embedding, action_mask)
+            action_hat = self.action_head(hs)
+            action_token_hat = torch.argmax(action_hat)
+            action_hat = action_detokenize(action_token_hat)
+            return action_hat
 
     def configure_optimizers(self):
         return self.optimizer

@@ -92,7 +92,7 @@ class LlavaConfig(PretrainedConfig):
         proprio_token_index=32002,
         latent_token_index=32003,
         chunk_input_token_index=32003,
-        chunk_size=100,
+        chunk_size=10,
         **kwargs,
     ):
         self.ignore_index = ignore_index
@@ -102,7 +102,7 @@ class LlavaConfig(PretrainedConfig):
         self.proprio_token_index = proprio_token_index
         self.latent_token_index = latent_token_index
         self.chunk_input_token_index = chunk_input_token_index
-        self.chunk_size = chunk_size
+        self.chunk_size = chunk_size * 16
         # robot config end
 
         self.projector_hidden_act = projector_hidden_act
